@@ -29,11 +29,13 @@ git pull
 
 ## Install locally
 
-Install the binary (drops `mirror-displays` into `~/.cargo/bin`):
+One-liner — installs the binary into `~/.cargo/bin`:
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/89jobrien/mirror-displays
 ```
+
+From a clone instead: `cargo install --path .`
 
 Or build and run it from the target directory without installing:
 
