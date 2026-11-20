@@ -1,16 +1,14 @@
 # mirror-displays
 
-macOS display mirroring via
-[displayplacer](https://github.com/jakehilborn/displayplacer).
-
-Mirrors the primary display to every connected external display and keeps
-a backup of the original layout, so `--restore` can undo it.
+macOS display mirroring, implemented natively via the public
+[CoreGraphics](https://developer.apple.com/documentation/coregraphics)
+API. No external dependencies — the original `displayplacer`-based
+version is retired.
 
 ## Requirements
 
 - macOS
 - `cargo`/`rustc` (via [rustup](https://rustup.rs) if you don't have them)
-- `displayplacer` (see [Install](#install-locally))
 
 ## Pull
 
@@ -25,15 +23,15 @@ To fetch updates from an existing clone:
 git pull
 ```
 
-(Alternatively: `gh repo clone 89jobrien/mirror-displays`.)
-
 ## Install locally
 
 One-liner — installs the binary into `~/.cargo/bin`:
 
 ```sh
-cargo install --git https://github.com/89jobrien/mirror-displays
+cargo install mirror-displays
 ```
+
+(From GitHub: `cargo install --git https://github.com/89jobrien/mirror-displays`.)
 
 From a clone instead: `cargo install --path .`
 
@@ -44,14 +42,6 @@ cargo build
 ./target/debug/mirror-displays --help
 ```
 
-### Install the displayplacer dependency
-
-```sh
-brew install displayplacer
-```
-
-`mirror-displays --install` does the same thing via Homebrew.
-
 ## Usage
 
 ```sh
@@ -59,7 +49,7 @@ mirror-displays            # mirror the primary display to all connected display
 mirror-displays --mirror   # same as the default above
 mirror-displays --restore  # restore the original layout saved before mirroring
 mirror-displays --list     # list connected displays
-mirror-displays --install  # install the displayplacer dependency
+mirror-displays --install  # nothing to install: no external dependencies
 mirror-displays --help     # usage
 ```
 

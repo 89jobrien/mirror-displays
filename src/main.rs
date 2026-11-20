@@ -1,16 +1,91 @@
-//! macOS display mirroring via `displayplacer`.
+//! macOS display mirroring via the public CoreGraphics API — no
+//! external dependencies.
 //!
-//! Rewrite of `mirror-displays.sh`: mirror the primary display to every
-//! connected external display, backing up the original layout so it can
-//! be restored later.
+//! - default or `--mirror`: mirror the primary display to all other displays
+//! - `--restore`: restore the original display configuration
+//! - `--list`: list connected displays
+//! - `--install`: nothing to install (the native version needs no
+//!   dependencies)
+//! - `--help`: usage
 
 use std::env;
+use std::ffi::c_void;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::exit;
 
 const APP: &str = "mirror-displays";
+
+type CGDirectDisplayID = u32;
+type CGError = i32;
+
+#[repr(C)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[repr(C)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+const K_CG_NULL_DIRECT_DISPLAY: CGDirectDisplayID = 0;
+const K_CG_CONFIGURE_PERMANENTLY: u32 = 2;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGGetActiveDisplayList(
+        maxDisplays: u32,
+        activeDisplays: *mut CGDirectDisplayID,
+        displayCount: *mut u32,
+    ) -> CGError;
+    fn CGDisplayIsMain(display: CGDirectDisplayID) -> i32;
+    fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
+    fn CGDisplayCopyDisplayMode(display: CGDirectDisplayID) -> *mut c_void;
+    fn CGDisplayCopyAllDisplayModes(
+        display: CGDirectDisplayID,
+        options: *mut c_void,
+    ) -> *const c_void;
+    fn CGDisplayModeGetWidth(mode: *mut c_void) -> usize;
+    fn CGDisplayModeGetHeight(mode: *mut c_void) -> usize;
+    fn CGDisplayModeGetRefreshRate(mode: *mut c_void) -> f64;
+    fn CGBeginDisplayConfiguration(config: *mut *mut c_void) -> CGError;
+    fn CGConfigureDisplayOrigin(
+        config: *mut c_void,
+        display: CGDirectDisplayID,
+        x: i32,
+        y: i32,
+    ) -> CGError;
+    fn CGConfigureDisplayWithDisplayMode(
+        config: *mut c_void,
+        display: CGDirectDisplayID,
+        mode: *mut c_void,
+        options: *mut c_void,
+    ) -> CGError;
+    fn CGConfigureDisplayMirrorOfDisplay(
+        config: *mut c_void,
+        display: CGDirectDisplayID,
+        master: CGDirectDisplayID,
+    ) -> CGError;
+    fn CGCancelDisplayConfiguration(config: *mut c_void) -> CGError;
+    fn CGCompleteDisplayConfiguration(config: *mut c_void, option: u32) -> CGError;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+}
+
+// ---- helpers ----
 
 fn log(msg: &str) {
     println!("[{}] {}", APP, msg);
@@ -18,7 +93,7 @@ fn log(msg: &str) {
 
 fn die(msg: &str) -> ! {
     eprintln!("[{}] ERROR: {}", APP, msg);
-    std::process::exit(1);
+    exit(1);
 }
 
 fn home_dir() -> PathBuf {
@@ -40,20 +115,7 @@ fn backup_path() -> PathBuf {
 
 fn check_os() {
     if env::consts::OS != "macos" {
-        die("This script only supports macOS.");
-    }
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-fn command_exists(name: &str) -> bool {
-    match env::var_os("PATH") {
-        Some(paths) => env::split_paths(&paths).any(|dir| is_executable_file(&dir.join(name))),
-        None => false,
+        die("This tool only supports macOS.");
     }
 }
 
@@ -64,265 +126,295 @@ fn exe_name() -> String {
         .unwrap_or_else(|| APP.to_string())
 }
 
-fn check_dependency() {
-    if !command_exists("displayplacer") {
-        die(&format!(
-            "displayplacer is missing. Run: {} --install",
-            exe_name()
-        ));
+// ---- display data ----
+
+#[derive(Clone, Debug, PartialEq)]
+struct ModeSpec {
+    width: usize,
+    height: usize,
+    refresh: f64,
+}
+
+impl ModeSpec {
+    fn from_mode(mode: *mut c_void) -> ModeSpec {
+        unsafe {
+            ModeSpec {
+                width: CGDisplayModeGetWidth(mode),
+                height: CGDisplayModeGetHeight(mode),
+                refresh: CGDisplayModeGetRefreshRate(mode),
+            }
+        }
+    }
+
+    fn matches(a: &ModeSpec, b: &ModeSpec) -> bool {
+        a.width == b.width && a.height == b.height && (a.refresh - b.refresh).abs() < 0.01
     }
 }
 
-fn install_dependency() {
-    if !command_exists("brew") {
-        die("Homebrew is required. Install it from https://brew.sh");
+#[derive(Clone, Debug)]
+struct DisplayInfo {
+    id: CGDirectDisplayID,
+    origin_x: f64,
+    origin_y: f64,
+    mode: ModeSpec,
+}
+
+fn enumerate_displays() -> Vec<DisplayInfo> {
+    unsafe {
+        let mut count: u32 = 0;
+        let mut ids: [CGDirectDisplayID; 32] = [0; 32];
+        let err = CGGetActiveDisplayList(32, ids.as_mut_ptr(), &mut count);
+        if err != 0 {
+            die("Unable to enumerate connected displays.");
+        }
+        if count > ids.len() as u32 {
+            die("Too many connected displays.");
+        }
+        let mut displays = Vec::new();
+        for i in 0..count {
+            let id = ids[i as usize];
+            let bounds = CGDisplayBounds(id);
+            let mode = current_mode(id);
+            displays.push(DisplayInfo {
+                id,
+                origin_x: bounds.origin.x,
+                origin_y: bounds.origin.y,
+                mode,
+            });
+        }
+        displays
     }
-    run_or_exit("brew", &["install", "displayplacer"]);
 }
 
-/// Run a command, exiting with its status (mirrors the script's `set -e`).
-fn run_or_exit(program: &str, args: &[&str]) {
-    match run(program, args) {
-        Some(status) if status.success() => std::process::exit(0),
-        Some(status) => std::process::exit(status.code().unwrap_or(1)),
-        None => std::process::exit(1),
+fn current_mode(id: CGDirectDisplayID) -> ModeSpec {
+    unsafe {
+        let mode = CGDisplayCopyDisplayMode(id);
+        if mode.is_null() {
+            die("Unable to read display mode.");
+        }
+        ModeSpec::from_mode(mode)
     }
 }
 
-/// Run a command with inherited stdio; `None` if it cannot be spawned.
-fn run(program: &str, args: &[&str]) -> Option<ExitStatus> {
-    Command::new(program).args(args).status().ok()
-}
-
-/// Capture stdout of a command (stderr passes through). `None` if the
-/// command fails or cannot be spawned.
-fn run_capture(program: &str, args: &[&str]) -> Option<String> {
-    let child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .ok()?;
-    let output = child.wait_with_output().ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
+fn find_mode_object(id: CGDirectDisplayID, spec: &ModeSpec) -> Option<*mut c_void> {
+    unsafe {
+        let modes = CGDisplayCopyAllDisplayModes(id, std::ptr::null_mut());
+        if modes.is_null() {
+            return None;
+        }
+        let n = CFArrayGetCount(modes);
+        for i in 0..n {
+            let mode = CFArrayGetValueAtIndex(modes, i) as *mut c_void;
+            if ModeSpec::matches(&ModeSpec::from_mode(mode), spec) {
+                return Some(mode);
+            }
+        }
         None
     }
 }
 
-/// Extract the quoted segments of a displayplacer profile line, mirroring
-/// the script's regex loop: repeated `\"([^\"]+)\"` captures.
-fn parse_quoted_args(s: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut offset = 0usize;
-    while let Some(rel_start) = s[offset..].find('"') {
-        let start = offset + rel_start;
-        let after_start = start + 1;
-        let Some(rel_end) = s[after_start..].find('"') else {
-            break;
-        };
-        let end = after_start + rel_end;
-        let arg = &s[after_start..end];
-        if !arg.is_empty() {
-            args.push(arg.to_string());
+fn primary_display(displays: &[DisplayInfo]) -> Option<&DisplayInfo> {
+    displays
+        .iter()
+        .find(|d| unsafe { CGDisplayIsMain(d.id) != 0 })
+        .or_else(|| {
+            displays
+                .iter()
+                .find(|d| d.origin_x == 0.0 && d.origin_y == 0.0)
+        })
+}
+
+// ---- backup ----
+
+fn backup_spec_line(d: &DisplayInfo) -> String {
+    format!(
+        "display {} {} {} {} {} {}\n",
+        d.id, d.origin_x, d.origin_y, d.mode.width, d.mode.height, d.mode.refresh
+    )
+}
+
+fn parse_backup_spec(line: &str) -> Option<DisplayInfo> {
+    let mut it = line.split_whitespace();
+    if it.next()? != "display" {
+        return None;
+    }
+    let id: CGDirectDisplayID = it.next()?.parse().ok()?;
+    let origin_x: f64 = it.next()?.parse().ok()?;
+    let origin_y: f64 = it.next()?.parse().ok()?;
+    let width: usize = it.next()?.parse().ok()?;
+    let height: usize = it.next()?.parse().ok()?;
+    let refresh: f64 = it.next()?.parse().ok()?;
+    Some(DisplayInfo {
+        id,
+        origin_x,
+        origin_y,
+        mode: ModeSpec {
+            width,
+            height,
+            refresh,
+        },
+    })
+}
+
+fn write_backup(displays: &[DisplayInfo], path: &Path) {
+    let mut content = String::from("mirror-displays original configuration\n");
+    for d in displays {
+        content.push_str(&backup_spec_line(d));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    fs::write(path, content).unwrap_or_else(|e| {
+        die(&format!(
+            "Unable to save original display configuration: {e}"
+        ))
+    });
+}
+
+// ---- mirror / restore ----
+
+fn apply_mirror(primary: CGDirectDisplayID, others: &[CGDirectDisplayID]) {
+    unsafe {
+        let mut config: *mut c_void = std::ptr::null_mut();
+        if CGBeginDisplayConfiguration(&mut config) != 0 {
+            die("Unable to configure displays.");
         }
-        offset = end + 1;
-    }
-    args
-}
-
-fn parse_profile(profile: &str) -> Vec<String> {
-    parse_quoted_args(profile)
-}
-
-/// The last line of `displayplacer list` output when any line starts with
-/// `displayplacer ` (the executable profile); empty otherwise.
-fn get_profile() -> String {
-    let output = match run_capture("displayplacer", &["list"]) {
-        Some(o) => o.trim_end_matches('\n').to_string(),
-        None => die("Unable to read display configuration."),
-    };
-
-    let mut saw_profile_line = false;
-    let mut last_line = String::new();
-    for line in output.lines() {
-        if line.starts_with("displayplacer ") {
-            saw_profile_line = true;
+        for &d in others {
+            if CGConfigureDisplayMirrorOfDisplay(config, d, primary) != 0 {
+                let _ = CGCancelDisplayConfiguration(config);
+                die(&format!("Unable to mirror display {d}."));
+            }
         }
-        last_line = line.to_owned();
-    }
-
-    if saw_profile_line && !last_line.is_empty() {
-        last_line
-    } else {
-        die("Could not extract display configuration.")
-    }
-}
-
-/// Extract the display id token from a config line: `^id:([^[:space:]]+)`
-/// (the capture is non-empty).
-fn parse_id_token(config: &str) -> Option<String> {
-    let rest = config.strip_prefix("id:")?;
-    let token: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-    (!token.is_empty()).then_some(token)
-}
-
-/// Flatten displayplacer mirror groups: `A+B+C` -> `["A", "B", "C"]`.
-fn flatten_ids(id: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut remaining = id;
-    while let Some((group_id, tail)) = remaining.split_once('+') {
-        ids.push(group_id.to_string());
-        remaining = tail;
-    }
-    ids.push(remaining.to_string());
-    ids
-}
-
-/// The primary display's config with its `id:` prefix removed, mirroring
-/// `sed 's/^id:[^ ]* //'`.
-fn rest_after_id(config: &str) -> String {
-    let Some(rest) = config.strip_prefix("id:") else {
-        return config.to_string();
-    };
-    match rest.find(' ') {
-        Some(pos) => rest[pos + 1..].to_string(),
-        None => config.to_string(),
+        if CGCompleteDisplayConfiguration(config, K_CG_CONFIGURE_PERMANENTLY) != 0 {
+            die(&format!(
+                "Mirroring failed. Your original profile is saved at {}",
+                backup_path().display()
+            ));
+        }
     }
 }
 
 fn enable_mirroring() {
     check_os();
-    check_dependency();
-
     log("Detecting connected displays...");
 
-    let profile = get_profile();
-    let profile_args = parse_profile(&profile);
-    if profile_args.is_empty() {
-        die("Could not parse display configuration.");
-    }
-
-    let mut primary: Option<String> = None;
-    let mut source_config = String::new();
-    let mut ids: Vec<String> = Vec::new();
-
-    for config in &profile_args {
-        if config.contains("enabled:false") {
-            continue;
-        }
-
-        let Some(display_id) = parse_id_token(config) else {
-            continue;
-        };
-
-        // Flatten any existing mirror groups.
-        ids.extend(flatten_ids(&display_id));
-
-        if config.contains("origin:(0,0)") {
-            primary = Some(display_id);
-            source_config = config.clone();
-        }
-    }
-
-    if ids.len() < 2 {
+    let displays = enumerate_displays();
+    if displays.len() < 2 {
         die("At least two enabled displays are required.");
     }
 
-    let primary = match primary {
-        Some(p) if !p.is_empty() => p,
-        _ => die("Cannot identify the primary display at origin (0,0)."),
-    };
-
-    // Do not overwrite the original backup on repeated runs.
-    fs::create_dir_all(state_dir())
-        .unwrap_or_else(|e| die(&format!("Unable to create {}: {e}", state_dir().display())));
+    let primary_id = primary_display(&displays)
+        .map(|d| d.id)
+        .unwrap_or_else(|| die("Cannot identify the primary display."));
 
     let backup = backup_path();
-    if !backup.is_file() {
+    if !backup.exists() {
         log("Saving original display arrangement...");
-        fs::write(&backup, format!("{}\n", profile))
-            .unwrap_or_else(|e| die(&format!("Unable to save original display configuration: {e}")));
+        write_backup(&displays, &backup);
     } else {
         log("Existing original configuration backup preserved.");
     }
 
-    // Build the grouped mirror ID list.
-    let grouped_ids = ids.join("+");
-
-    // Preserve the primary display's current mode and settings.
-    let rest = rest_after_id(&source_config);
-    if rest.is_empty() {
-        die("Could not determine primary display settings.");
-    }
-    let mirror_config = format!("id:{grouped_ids} {rest}");
-
-    log(&format!("Primary display: {primary}"));
-    log(&format!("Connected enabled displays: {}", ids.len()));
+    log(&format!("Primary display: {primary_id}"));
+    log(&format!("Connected enabled displays: {}", displays.len()));
     log("Applying mirroring configuration...");
 
-    match run("displayplacer", &[mirror_config.as_str()]) {
-        Some(status) if status.success() => {}
-        _ => die(&format!(
-            "Mirroring failed. Your original profile is saved at {}",
-            backup.display()
-        )),
-    }
+    let others: Vec<CGDirectDisplayID> = displays
+        .iter()
+        .filter(|d| d.id != primary_id)
+        .map(|d| d.id)
+        .collect();
+    apply_mirror(primary_id, &others);
 
     log("Mirroring configuration applied.");
 }
 
 fn restore_displays() {
     check_os();
-    check_dependency();
-
     let backup = backup_path();
     if !backup.is_file() {
         die("No saved original configuration found.");
     }
-
-    let profile =
+    let text =
         fs::read_to_string(&backup).unwrap_or_else(|_| die("Unable to read saved configuration."));
-    let profile_args = parse_profile(&profile);
-    if profile_args.is_empty() {
-        die("Could not parse display configuration.");
-    }
+    let specs: Vec<DisplayInfo> = text.lines().filter_map(parse_backup_spec).collect();
 
     log("Restoring original display configuration...");
 
-    let args: Vec<&str> = profile_args.iter().map(String::as_str).collect();
-    match run("displayplacer", &args) {
-        Some(status) if status.success() => {}
-        _ => die(&format!(
-            "Restoration failed. Backup retained at {}",
-            backup.display()
-        )),
+    let displays = enumerate_displays();
+    unsafe {
+        let mut config: *mut c_void = std::ptr::null_mut();
+        if CGBeginDisplayConfiguration(&mut config) != 0 {
+            die("Unable to configure displays.");
+        }
+        for spec in &specs {
+            if !displays.iter().any(|d| d.id == spec.id) {
+                log(&format!("Display {} not found; skipped.", spec.id));
+                continue;
+            }
+            let _ = CGConfigureDisplayMirrorOfDisplay(config, spec.id, K_CG_NULL_DIRECT_DISPLAY);
+            let _ = CGConfigureDisplayOrigin(
+                config,
+                spec.id,
+                spec.origin_x as i32,
+                spec.origin_y as i32,
+            );
+            if let Some(mode) = find_mode_object(spec.id, &spec.mode) {
+                let _ =
+                    CGConfigureDisplayWithDisplayMode(config, spec.id, mode, std::ptr::null_mut());
+            }
+        }
+        if CGCompleteDisplayConfiguration(config, K_CG_CONFIGURE_PERMANENTLY) != 0 {
+            die(&format!(
+                "Restoration failed. Backup retained at {}",
+                backup.display()
+            ));
+        }
     }
 
     let _ = fs::remove_file(&backup);
-
     log("Original display configuration restored.");
 }
 
+// ---- other commands ----
+
 fn list_displays() {
-    check_dependency();
-    run_or_exit("displayplacer", &["list"]);
+    let displays = enumerate_displays();
+    log(&format!("Connected displays: {}", displays.len()));
+    for d in &displays {
+        println!(
+            "display {} origin:({:.0},{:.0}) mode:({}x{}@{}Hz)",
+            d.id, d.origin_x, d.origin_y, d.mode.width, d.mode.height, d.mode.refresh
+        );
+    }
+}
+
+fn install_dependency() {
+    log("The native CoreGraphics version needs no external dependencies.");
 }
 
 fn show_help() {
     let lines = [
-        format!("{} - macOS display mirroring", APP),
+        format!("{} - macOS display mirroring (CoreGraphics)", APP),
         String::new(),
         "Usage:".to_string(),
-        format!("  {}                  Enable display mirroring", exe_name()),
-        format!("  {} --mirror         Enable display mirroring", exe_name()),
         format!(
-            "  {} --restore        Restore original display arrangement",
+            "  {}                  Mirror the primary display to all connected displays",
+            exe_name()
+        ),
+        format!(
+            "  {} --mirror         Mirror the primary display to all connected displays",
+            exe_name()
+        ),
+        format!(
+            "  {} --restore        Restore the original display layout",
             exe_name()
         ),
         format!("  {} --list           List connected displays", exe_name()),
-        format!("  {} --install        Install displayplacer", exe_name()),
+        format!(
+            "  {} --install        Nothing to install (no external dependencies)",
+            exe_name()
+        ),
         format!("  {} --help           Show this help", exe_name()),
         String::new(),
         "Backup:".to_string(),
@@ -355,42 +447,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flatten_ids_splits_mirror_groups() {
-        assert_eq!(
-            flatten_ids("A+B+C"),
-            vec!["A".to_string(), "B".to_string(), "C".to_string()]
-        );
-        assert_eq!(flatten_ids("A+B"), vec!["A".to_string(), "B".to_string()]);
-        assert_eq!(flatten_ids("A"), vec!["A".to_string()]);
-        assert_eq!(flatten_ids("A+"), vec!["A".to_string(), String::new()]);
+    fn backup_spec_round_trip() {
+        let d = DisplayInfo {
+            id: 42,
+            origin_x: 0.0,
+            origin_y: 1080.0,
+            mode: ModeSpec {
+                width: 1920,
+                height: 1080,
+                refresh: 60.0,
+            },
+        };
+        let parsed = parse_backup_spec(&backup_spec_line(&d)).unwrap();
+        assert_eq!(parsed.id, 42);
+        assert_eq!(parsed.origin_y, 1080.0);
+        assert_eq!(parsed.mode.width, 1920);
+        assert_eq!(parsed.mode.height, 1080);
+        assert!((parsed.mode.refresh - 60.0).abs() < 0.01);
     }
 
     #[test]
-    fn parse_id_token_matches_regex_anchor() {
-        assert_eq!(
-            parse_id_token("id:A+B origin:(0,0)"),
-            Some("A+B".to_string())
-        );
-        assert_eq!(parse_id_token("id: origin:(0,0)"), None);
-        assert_eq!(parse_id_token("origin:(0,0)"), None);
+    fn parse_backup_spec_ignores_non_display_lines() {
+        assert!(parse_backup_spec("mirror-displays original configuration").is_none());
+        assert!(parse_backup_spec("garbage").is_none());
     }
 
     #[test]
-    fn rest_after_id_matches_sed() {
-        assert_eq!(
-            rest_after_id("id:A+B origin:(0,0) res:1920x1080"),
-            "origin:(0,0) res:1920x1080"
-        );
-        assert_eq!(rest_after_id("id:A"), "id:A");
-        assert_eq!(rest_after_id("id: A B"), "A B");
-    }
-
-    #[test]
-    fn parse_quoted_args_extracts_segments() {
-        assert_eq!(
-            parse_quoted_args("displayplacer \"id:A+id:B origin:(0,0)\""),
-            vec!["id:A+id:B origin:(0,0)".to_string()]
-        );
-        assert_eq!(parse_quoted_args("no quotes here"), Vec::<String>::new());
+    fn mode_spec_matches_within_epsilon() {
+        let a = ModeSpec {
+            width: 1920,
+            height: 1200,
+            refresh: 59.94,
+        };
+        let b = ModeSpec {
+            width: 1920,
+            height: 1200,
+            refresh: 59.93998718261719,
+        };
+        assert!(ModeSpec::matches(&a, &b));
+        assert!(!ModeSpec::matches(
+            &a,
+            &ModeSpec {
+                width: 1920,
+                height: 1200,
+                refresh: 50.0
+            }
+        ));
     }
 }

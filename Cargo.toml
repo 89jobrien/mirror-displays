@@ -1,7 +1,7 @@
 [package]
 name = "mirror-displays"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
-description = "macOS display mirroring via displayplacer"
+description = "macOS display mirroring via CoreGraphics — no external dependencies"
 repository = "https://github.com/89jobrien/mirror-displays"
 license = "MIT"
