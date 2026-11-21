@@ -74,14 +74,15 @@ fn check_dependency() {
 }
 
 fn install_dependency() {
+    check_os();
     if !command_exists("brew") {
         die("Homebrew is required. Install it from https://brew.sh");
     }
-    run_or_exit("brew", &["install", "displayplacer"]);
+    exit_with_status("brew", &["install", "displayplacer"]);
 }
 
-/// Run a command, exiting with its status (mirrors the script's `set -e`).
-fn run_or_exit(program: &str, args: &[&str]) {
+/// Run a command and exit with its status (mirrors the script's `set -e`).
+fn exit_with_status(program: &str, args: &[&str]) {
     match run(program, args) {
         Some(status) if status.success() => std::process::exit(0),
         Some(status) => std::process::exit(status.code().unwrap_or(1)),
@@ -132,32 +133,20 @@ fn parse_quoted_args(s: &str) -> Vec<String> {
     args
 }
 
-fn parse_profile(profile: &str) -> Vec<String> {
-    parse_quoted_args(profile)
+/// The executable profile line from `displayplacer list` output: the last
+/// line that starts with `displayplacer `. Other trailing output is ignored.
+fn parse_profile_line(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("displayplacer "))
+        .map(str::to_owned)
 }
 
-/// The last line of `displayplacer list` output when any line starts with
-/// `displayplacer ` (the executable profile); empty otherwise.
 fn get_profile() -> String {
-    let output = match run_capture("displayplacer", &["list"]) {
-        Some(o) => o.trim_end_matches('\n').to_string(),
-        None => die("Unable to read display configuration."),
-    };
-
-    let mut saw_profile_line = false;
-    let mut last_line = String::new();
-    for line in output.lines() {
-        if line.starts_with("displayplacer ") {
-            saw_profile_line = true;
-        }
-        last_line = line.to_owned();
-    }
-
-    if saw_profile_line && !last_line.is_empty() {
-        last_line
-    } else {
-        die("Could not extract display configuration.")
-    }
+    let output = run_capture("displayplacer", &["list"])
+        .unwrap_or_else(|| die("Unable to read display configuration."));
+    parse_profile_line(&output).unwrap_or_else(|| die("Could not extract display configuration."))
 }
 
 /// Extract the display id token from a config line: `^id:([^[:space:]]+)`
@@ -169,15 +158,12 @@ fn parse_id_token(config: &str) -> Option<String> {
 }
 
 /// Flatten displayplacer mirror groups: `A+B+C` -> `["A", "B", "C"]`.
+/// Empty segments (from a stray `+`) are dropped.
 fn flatten_ids(id: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut remaining = id;
-    while let Some((group_id, tail)) = remaining.split_once('+') {
-        ids.push(group_id.to_string());
-        remaining = tail;
-    }
-    ids.push(remaining.to_string());
-    ids
+    id.split('+')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The primary display's config with its `id:` prefix removed, mirroring
@@ -192,20 +178,23 @@ fn rest_after_id(config: &str) -> String {
     }
 }
 
-fn enable_mirroring() {
-    check_os();
-    check_dependency();
+/// What `--mirror` will apply, derived from the `displayplacer list` profile.
+#[derive(Debug, PartialEq)]
+struct MirrorPlan {
+    primary: String,
+    display_count: usize,
+    config: String,
+}
 
-    log("Detecting connected displays...");
-
-    let profile = get_profile();
-    let profile_args = parse_profile(&profile);
+/// Decide the mirror configuration from a profile line. Pure: it reads no
+/// hardware and writes nothing, so it can be tested with sample profiles.
+fn plan_mirror(profile: &str) -> Result<MirrorPlan, &'static str> {
+    let profile_args = parse_quoted_args(profile);
     if profile_args.is_empty() {
-        die("Could not parse display configuration.");
+        return Err("Could not parse display configuration.");
     }
 
-    let mut primary: Option<String> = None;
-    let mut source_config = String::new();
+    let mut primary: Option<(String, String)> = None;
     let mut ids: Vec<String> = Vec::new();
 
     for config in &profile_args {
@@ -221,19 +210,39 @@ fn enable_mirroring() {
         ids.extend(flatten_ids(&display_id));
 
         if config.contains("origin:(0,0)") {
-            primary = Some(display_id);
-            source_config = config.clone();
+            primary = Some((display_id, config.clone()));
         }
     }
 
     if ids.len() < 2 {
-        die("At least two enabled displays are required.");
+        return Err("At least two enabled displays are required.");
     }
 
-    let primary = match primary {
-        Some(p) if !p.is_empty() => p,
-        _ => die("Cannot identify the primary display at origin (0,0)."),
+    let Some((primary, source_config)) = primary else {
+        return Err("Cannot identify the primary display at origin (0,0).");
     };
+
+    // Preserve the primary display's current mode and settings.
+    let rest = rest_after_id(&source_config);
+    if rest.is_empty() {
+        return Err("Could not determine primary display settings.");
+    }
+
+    Ok(MirrorPlan {
+        primary,
+        display_count: ids.len(),
+        config: format!("id:{} {rest}", ids.join("+")),
+    })
+}
+
+fn enable_mirroring() {
+    check_os();
+    check_dependency();
+
+    log("Detecting connected displays...");
+
+    let profile = get_profile();
+    let plan = plan_mirror(&profile).unwrap_or_else(|msg| die(msg));
 
     // Do not overwrite the original backup on repeated runs.
     fs::create_dir_all(state_dir())
@@ -242,27 +251,23 @@ fn enable_mirroring() {
     let backup = backup_path();
     if !backup.is_file() {
         log("Saving original display arrangement...");
-        fs::write(&backup, format!("{}\n", profile))
-            .unwrap_or_else(|e| die(&format!("Unable to save original display configuration: {e}")));
+        fs::write(&backup, format!("{}\n", profile)).unwrap_or_else(|e| {
+            die(&format!(
+                "Unable to save original display configuration: {e}"
+            ))
+        });
     } else {
         log("Existing original configuration backup preserved.");
     }
 
-    // Build the grouped mirror ID list.
-    let grouped_ids = ids.join("+");
-
-    // Preserve the primary display's current mode and settings.
-    let rest = rest_after_id(&source_config);
-    if rest.is_empty() {
-        die("Could not determine primary display settings.");
-    }
-    let mirror_config = format!("id:{grouped_ids} {rest}");
-
-    log(&format!("Primary display: {primary}"));
-    log(&format!("Connected enabled displays: {}", ids.len()));
+    log(&format!("Primary display: {}", plan.primary));
+    log(&format!(
+        "Connected enabled displays: {}",
+        plan.display_count
+    ));
     log("Applying mirroring configuration...");
 
-    match run("displayplacer", &[mirror_config.as_str()]) {
+    match run("displayplacer", &[plan.config.as_str()]) {
         Some(status) if status.success() => {}
         _ => die(&format!(
             "Mirroring failed. Your original profile is saved at {}",
@@ -284,7 +289,7 @@ fn restore_displays() {
 
     let profile =
         fs::read_to_string(&backup).unwrap_or_else(|_| die("Unable to read saved configuration."));
-    let profile_args = parse_profile(&profile);
+    let profile_args = parse_quoted_args(&profile);
     if profile_args.is_empty() {
         die("Could not parse display configuration.");
     }
@@ -295,7 +300,7 @@ fn restore_displays() {
     match run("displayplacer", &args) {
         Some(status) if status.success() => {}
         _ => die(&format!(
-            "Restoration failed. Backup retained at {}",
+            "Restoration failed. Backup retained at {}. Run --list to check the current display IDs.",
             backup.display()
         )),
     }
@@ -307,7 +312,7 @@ fn restore_displays() {
 
 fn list_displays() {
     check_dependency();
-    run_or_exit("displayplacer", &["list"]);
+    exit_with_status("displayplacer", &["list"]);
 }
 
 fn show_help() {
@@ -344,7 +349,7 @@ fn main() {
             list_displays();
         }
         Some("--restore") => restore_displays(),
-        Some("--mirror") | Some("") | None => enable_mirroring(),
+        Some("--mirror") | None => enable_mirroring(),
         Some("--help") | Some("-h") => show_help(),
         Some(other) => die(&format!("Unknown option: {other}")),
     }
@@ -354,6 +359,8 @@ fn main() {
 mod tests {
     use super::*;
 
+    const TWO_DISPLAYS: &str = "displayplacer \"id:A res:1920x1080 origin:(0,0) enabled:true\" \"id:B res:2560x1440 origin:(1920,0) enabled:true\"";
+
     #[test]
     fn flatten_ids_splits_mirror_groups() {
         assert_eq!(
@@ -362,7 +369,12 @@ mod tests {
         );
         assert_eq!(flatten_ids("A+B"), vec!["A".to_string(), "B".to_string()]);
         assert_eq!(flatten_ids("A"), vec!["A".to_string()]);
-        assert_eq!(flatten_ids("A+"), vec!["A".to_string(), String::new()]);
+    }
+
+    #[test]
+    fn flatten_ids_drops_empty_segments() {
+        assert_eq!(flatten_ids("A+"), vec!["A".to_string()]);
+        assert_eq!(flatten_ids("+A++B"), vec!["A".to_string(), "B".to_string()]);
     }
 
     #[test]
@@ -392,5 +404,65 @@ mod tests {
             vec!["id:A+id:B origin:(0,0)".to_string()]
         );
         assert_eq!(parse_quoted_args("no quotes here"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_profile_line_ignores_trailing_output() {
+        let output = format!("Persistent screen id: A\n\n{TWO_DISPLAYS}\nsome trailing note\n");
+        assert_eq!(parse_profile_line(&output), Some(TWO_DISPLAYS.to_string()));
+    }
+
+    #[test]
+    fn parse_profile_line_none_without_profile() {
+        assert_eq!(parse_profile_line("Persistent screen id: A\n"), None);
+    }
+
+    #[test]
+    fn plan_mirror_groups_all_enabled_displays() {
+        assert_eq!(
+            plan_mirror(TWO_DISPLAYS),
+            Ok(MirrorPlan {
+                primary: "A".to_string(),
+                display_count: 2,
+                config: "id:A+B res:1920x1080 origin:(0,0) enabled:true".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn plan_mirror_skips_disabled_displays() {
+        let profile = format!("{TWO_DISPLAYS} \"id:C res:1280x720 origin:(0,0) enabled:false\"");
+        let plan = plan_mirror(&profile).unwrap();
+        assert_eq!(plan.display_count, 2);
+        assert_eq!(
+            plan.config,
+            "id:A+B res:1920x1080 origin:(0,0) enabled:true"
+        );
+    }
+
+    #[test]
+    fn plan_mirror_rejects_single_display() {
+        let profile = "displayplacer \"id:A res:1920x1080 origin:(0,0) enabled:true\"";
+        assert_eq!(
+            plan_mirror(profile),
+            Err("At least two enabled displays are required.")
+        );
+    }
+
+    #[test]
+    fn plan_mirror_rejects_missing_primary() {
+        let profile = "displayplacer \"id:A res:1920x1080 origin:(10,0) enabled:true\" \"id:B res:2560x1440 origin:(1920,0) enabled:true\"";
+        assert_eq!(
+            plan_mirror(profile),
+            Err("Cannot identify the primary display at origin (0,0).")
+        );
+    }
+
+    #[test]
+    fn plan_mirror_rejects_unparseable_profile() {
+        assert_eq!(
+            plan_mirror("no quoted segments"),
+            Err("Could not parse display configuration.")
+        );
     }
 }

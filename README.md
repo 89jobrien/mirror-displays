@@ -50,7 +50,7 @@ cargo build
 brew install displayplacer
 ```
 
-`mirror-displays --install` does the same thing via Homebrew.
+`mirror-displays --install` runs the same `brew install displayplacer` command.
 
 ## Usage
 
@@ -65,6 +65,15 @@ mirror-displays --help     # usage
 
 The backup of the original layout lives at
 `~/.config/mirror-displays/original-profile`.
+
+The backup is written the first time you mirror and is kept on later
+`--mirror` runs, so `--restore` always returns to the layout from before
+the first mirror, even if you rearranged displays in between. Running
+`--restore` deletes the backup once it succeeds.
+
+If `--restore` fails, the backup is kept. Run `--list` to check the current
+display IDs. If the displays were unplugged or replaced, the saved IDs may no
+longer apply; fix the layout by hand, then delete the backup file.
 
 ## Development
 
