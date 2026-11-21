@@ -8,6 +8,7 @@
 //!   dependencies)
 //! - `--help`: usage
 
+use std::cell::RefCell;
 use std::env;
 use std::ffi::c_void;
 use std::fs;
@@ -216,11 +217,11 @@ fn find_mode_object(id: CGDirectDisplayID, spec: &ModeSpec) -> Option<*mut c_voi
 fn primary_display(displays: &[DisplayInfo]) -> Option<&DisplayInfo> {
     displays
         .iter()
-        .find(|d| unsafe { CGDisplayIsMain(d.id) != 0 })
+        .find(|d| d.origin_x == 0.0 && d.origin_y == 0.0)
         .or_else(|| {
             displays
                 .iter()
-                .find(|d| d.origin_x == 0.0 && d.origin_y == 0.0)
+                .find(|d| unsafe { CGDisplayIsMain(d.id) != 0 })
         })
 }
 
@@ -271,87 +272,47 @@ fn write_backup(displays: &[DisplayInfo], path: &Path) {
     });
 }
 
-// ---- mirror / restore ----
+// ---- backend abstraction (real CoreGraphics + mock for tests) ----
 
-fn apply_mirror(primary: CGDirectDisplayID, others: &[CGDirectDisplayID]) {
+trait DisplayBackend {
+    fn enumerate(&self) -> Vec<DisplayInfo>;
+    fn apply_mirror(
+        &self,
+        primary: CGDirectDisplayID,
+        others: &[CGDirectDisplayID],
+    ) -> Result<(), String>;
+    fn restore(&self, specs: &[DisplayInfo]) -> Result<(), String>;
+}
+
+fn apply_mirror_real(
+    primary: CGDirectDisplayID,
+    others: &[CGDirectDisplayID],
+) -> Result<(), String> {
     unsafe {
         let mut config: *mut c_void = std::ptr::null_mut();
         if CGBeginDisplayConfiguration(&mut config) != 0 {
-            die("Unable to configure displays.");
+            return Err("Unable to configure displays.".into());
         }
         for &d in others {
             if CGConfigureDisplayMirrorOfDisplay(config, d, primary) != 0 {
                 let _ = CGCancelDisplayConfiguration(config);
-                die(&format!("Unable to mirror display {d}."));
+                return Err(format!("Unable to mirror display {d}."));
             }
         }
         if CGCompleteDisplayConfiguration(config, K_CG_CONFIGURE_PERMANENTLY) != 0 {
-            die(&format!(
-                "Mirroring failed. Your original profile is saved at {}",
-                backup_path().display()
-            ));
+            return Err("Mirroring failed".into());
         }
     }
+    Ok(())
 }
 
-fn enable_mirroring() {
-    check_os();
-    log("Detecting connected displays...");
-
-    let displays = enumerate_displays();
-    if displays.len() < 2 {
-        die("At least two enabled displays are required.");
-    }
-
-    let primary_id = primary_display(&displays)
-        .map(|d| d.id)
-        .unwrap_or_else(|| die("Cannot identify the primary display."));
-
-    let backup = backup_path();
-    if !backup.exists() {
-        log("Saving original display arrangement...");
-        write_backup(&displays, &backup);
-    } else {
-        log("Existing original configuration backup preserved.");
-    }
-
-    log(&format!("Primary display: {primary_id}"));
-    log(&format!("Connected enabled displays: {}", displays.len()));
-    log("Applying mirroring configuration...");
-
-    let others: Vec<CGDirectDisplayID> = displays
-        .iter()
-        .filter(|d| d.id != primary_id)
-        .map(|d| d.id)
-        .collect();
-    apply_mirror(primary_id, &others);
-
-    log("Mirroring configuration applied.");
-}
-
-fn restore_displays() {
-    check_os();
-    let backup = backup_path();
-    if !backup.is_file() {
-        die("No saved original configuration found.");
-    }
-    let text =
-        fs::read_to_string(&backup).unwrap_or_else(|_| die("Unable to read saved configuration."));
-    let specs: Vec<DisplayInfo> = text.lines().filter_map(parse_backup_spec).collect();
-
-    log("Restoring original display configuration...");
-
-    let displays = enumerate_displays();
+fn restore_real(specs: &[DisplayInfo]) -> Result<(), String> {
     unsafe {
         let mut config: *mut c_void = std::ptr::null_mut();
         if CGBeginDisplayConfiguration(&mut config) != 0 {
-            die("Unable to configure displays.");
+            return Err("Unable to configure displays.".into());
         }
-        for spec in &specs {
-            if !displays.iter().any(|d| d.id == spec.id) {
-                log(&format!("Display {} not found; skipped.", spec.id));
-                continue;
-            }
+        for spec in specs {
             let _ = CGConfigureDisplayMirrorOfDisplay(config, spec.id, K_CG_NULL_DIRECT_DISPLAY);
             let _ = CGConfigureDisplayOrigin(
                 config,
@@ -365,15 +326,146 @@ fn restore_displays() {
             }
         }
         if CGCompleteDisplayConfiguration(config, K_CG_CONFIGURE_PERMANENTLY) != 0 {
-            die(&format!(
-                "Restoration failed. Backup retained at {}",
-                backup.display()
-            ));
+            return Err("Restoration failed".into());
         }
     }
+    Ok(())
+}
 
-    let _ = fs::remove_file(&backup);
+struct CgBackend;
+
+impl DisplayBackend for CgBackend {
+    fn enumerate(&self) -> Vec<DisplayInfo> {
+        enumerate_displays()
+    }
+
+    fn apply_mirror(
+        &self,
+        primary: CGDirectDisplayID,
+        others: &[CGDirectDisplayID],
+    ) -> Result<(), String> {
+        apply_mirror_real(primary, others)
+    }
+
+    fn restore(&self, specs: &[DisplayInfo]) -> Result<(), String> {
+        restore_real(specs)
+    }
+}
+
+/// In-memory backend for tests: records mirror applications and restores.
+#[derive(Default)]
+struct MockBackend {
+    displays: Vec<DisplayInfo>,
+    mirror_calls: RefCell<Vec<(CGDirectDisplayID, CGDirectDisplayID)>>,
+    restored: RefCell<Vec<DisplayInfo>>,
+    fail_mirror: bool,
+    fail_restore: bool,
+}
+
+impl MockBackend {
+    fn new(displays: Vec<DisplayInfo>) -> MockBackend {
+        MockBackend {
+            displays,
+            ..Default::default()
+        }
+    }
+}
+
+impl DisplayBackend for MockBackend {
+    fn enumerate(&self) -> Vec<DisplayInfo> {
+        self.displays.clone()
+    }
+
+    fn apply_mirror(
+        &self,
+        primary: CGDirectDisplayID,
+        others: &[CGDirectDisplayID],
+    ) -> Result<(), String> {
+        if self.fail_mirror {
+            return Err("Mirroring failed".into());
+        }
+        let mut calls = self.mirror_calls.borrow_mut();
+        for &d in others {
+            calls.push((d, primary));
+        }
+        Ok(())
+    }
+
+    fn restore(&self, specs: &[DisplayInfo]) -> Result<(), String> {
+        if self.fail_restore {
+            return Err("Restoration failed".into());
+        }
+        *self.restored.borrow_mut() = specs.to_vec();
+        Ok(())
+    }
+}
+
+// ---- logic (testable with any backend) ----
+
+fn enable_mirroring_with(backend: &dyn DisplayBackend, backup: &Path) {
+    log("Detecting connected displays...");
+
+    let displays = backend.enumerate();
+    if displays.len() < 2 {
+        die("At least two enabled displays are required.");
+    }
+
+    let primary_id = primary_display(&displays)
+        .map(|d| d.id)
+        .unwrap_or_else(|| die("Cannot identify the primary display."));
+
+    if !backup.is_file() {
+        log("Saving original display arrangement...");
+        write_backup(&displays, backup);
+    } else {
+        log("Existing original configuration backup preserved.");
+    }
+
+    log(&format!("Primary display: {primary_id}"));
+    log(&format!("Connected enabled displays: {}", displays.len()));
+    log("Applying mirroring configuration...");
+
+    let others: Vec<CGDirectDisplayID> = displays
+        .iter()
+        .filter(|d| d.id != primary_id)
+        .map(|d| d.id)
+        .collect();
+    if let Err(e) = backend.apply_mirror(primary_id, &others) {
+        die(&format!(
+            "{e}. Your original profile is saved at {}",
+            backup.display()
+        ));
+    }
+
+    log("Mirroring configuration applied.");
+}
+
+fn enable_mirroring() {
+    check_os();
+    enable_mirroring_with(&CgBackend, &backup_path());
+}
+
+fn restore_displays_with(backend: &dyn DisplayBackend, backup: &Path) {
+    if !backup.is_file() {
+        die("No saved original configuration found.");
+    }
+    let text =
+        fs::read_to_string(backup).unwrap_or_else(|_| die("Unable to read saved configuration."));
+    let specs: Vec<DisplayInfo> = text.lines().filter_map(parse_backup_spec).collect();
+
+    log("Restoring original display configuration...");
+
+    if let Err(e) = backend.restore(&specs) {
+        die(&format!("{e}. Backup retained at {}", backup.display()));
+    }
+
+    let _ = fs::remove_file(backup);
     log("Original display configuration restored.");
+}
+
+fn restore_displays() {
+    check_os();
+    restore_displays_with(&CgBackend, &backup_path());
 }
 
 // ---- other commands ----
@@ -446,18 +538,35 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn spec(width: usize, height: usize, refresh: f64) -> ModeSpec {
+        ModeSpec {
+            width,
+            height,
+            refresh,
+        }
+    }
+
+    fn display(id: CGDirectDisplayID, origin_x: f64, origin_y: f64, mode: ModeSpec) -> DisplayInfo {
+        DisplayInfo {
+            id,
+            origin_x,
+            origin_y,
+            mode,
+        }
+    }
+
+    fn temp_backup_path(name: &str) -> PathBuf {
+        let mut p = env::temp_dir();
+        p.push(format!(
+            "mirror-displays-test-{}-{name}",
+            std::process::id()
+        ));
+        p
+    }
+
     #[test]
     fn backup_spec_round_trip() {
-        let d = DisplayInfo {
-            id: 42,
-            origin_x: 0.0,
-            origin_y: 1080.0,
-            mode: ModeSpec {
-                width: 1920,
-                height: 1080,
-                refresh: 60.0,
-            },
-        };
+        let d = display(42, 0.0, 1080.0, spec(1920, 1080, 60.0));
         let parsed = parse_backup_spec(&backup_spec_line(&d)).unwrap();
         assert_eq!(parsed.id, 42);
         assert_eq!(parsed.origin_y, 1080.0);
@@ -474,24 +583,53 @@ mod tests {
 
     #[test]
     fn mode_spec_matches_within_epsilon() {
-        let a = ModeSpec {
-            width: 1920,
-            height: 1200,
-            refresh: 59.94,
-        };
-        let b = ModeSpec {
-            width: 1920,
-            height: 1200,
-            refresh: 59.93998718261719,
-        };
+        let a = spec(1920, 1200, 59.94);
+        let b = spec(1920, 1200, 59.93998718261719);
         assert!(ModeSpec::matches(&a, &b));
-        assert!(!ModeSpec::matches(
-            &a,
-            &ModeSpec {
-                width: 1920,
-                height: 1200,
-                refresh: 50.0
-            }
-        ));
+        assert!(!ModeSpec::matches(&a, &spec(1920, 1200, 50.0)));
+    }
+
+    #[test]
+    fn enable_mirroring_mirrors_non_primary_displays() {
+        let backend = MockBackend::new(vec![
+            display(1, 0.0, 0.0, spec(1920, 1200, 120.0)),
+            display(2, 1920.0, 0.0, spec(1920, 1200, 60.0)),
+        ]);
+        let backup = temp_backup_path("enable-mirror");
+
+        enable_mirroring_with(&backend, &backup);
+
+        let calls = backend.mirror_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], (2, 1));
+        drop(calls);
+
+        let specs: Vec<DisplayInfo> = fs::read_to_string(&backup)
+            .unwrap()
+            .lines()
+            .filter_map(parse_backup_spec)
+            .collect();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].id, 1);
+        assert_eq!(specs[1].id, 2);
+        let _ = fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn restore_displays_applies_saved_specs() {
+        let backend = MockBackend::default();
+        let backup = temp_backup_path("restore");
+        fs::write(
+            &backup,
+            "mirror-displays original configuration\ndisplay 1 0 0 1920 1200 120\n",
+        )
+        .unwrap();
+
+        restore_displays_with(&backend, &backup);
+
+        assert_eq!(backend.restored.borrow().len(), 1);
+        assert_eq!(backend.restored.borrow()[0].id, 1);
+        assert_eq!(backend.restored.borrow()[0].mode.width, 1920);
+        assert!(!backup.exists());
     }
 }
